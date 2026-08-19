@@ -1,0 +1,96 @@
+# Updated: 2026-04-20 by Constructor Tech
+name: CFS
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '**/*.md'
+      - 'docs/**'
+      - 'gears/**/docs/**'
+      - 'gears/**/src/**'
+      - 'gears/**/tests/**'
+      - '.cf-studio/config/**'
+      - '.cf-studio-kit.toml'
+      - 'studio-kit-gears/**'
+      - 'docs/spec-templates/**'
+      - 'Makefile'
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: cfs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Local dev enables incremental compilation via [profile.dev]; CI does not want
+  # the extra codegen and disk churn.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  validate_artifacts:
+    name: Validate CFS Artifacts
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          clean: 'true'
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Setup pipx
+        run: |
+          python -m pip install --user pipx
+          python -m pipx ensurepath
+
+      - name: Validate artifacts
+        run: make cfs-validate
+
+      - name: Validate registered kits
+        run: make cfs-validate-kits
+
+      - name: Detect local kit changes
+        id: local_kit_changes
+        shell: bash
+        run: |
+          base_ref="${{ github.base_ref }}"
+
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "$base_ref" ]; then
+            # Full (not --depth=1) fetch so the three-dot diff can find a merge
+            # base: checkout uses fetch-depth: 0 (full HEAD), so a shallow base
+            # ref has no reachable common ancestor and the diff fails with
+            # "no merge base" (notably on fork PRs). Tolerate a failed fetch and
+            # a failed diff so this detection step never hard-fails the job (the
+            # run shell is `bash -eo pipefail`, so an unguarded fetch would exit).
+            git fetch --no-tags origin "$base_ref" || true
+            changed_files="$(git diff --name-only "origin/$base_ref"...HEAD 2>/dev/null || true)"
+          else
+            changed_files="$(
+              git diff --name-only HEAD~1 HEAD 2>/dev/null || true
+              git status --short | sed 's/^...//'
+            )"
+          fi
+
+          if printf '%s\n' "$changed_files" | grep -Eq '^(studio-kit-gears/|docs/spec-templates/|\.cf-studio-kit\.toml$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate local Gears kit
+        if: steps.local_kit_changes.outputs.changed == 'true'
+        run: make cfs-validate-kit-local

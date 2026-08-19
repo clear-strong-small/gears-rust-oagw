@@ -1,0 +1,618 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  # PR CI only ever validates the ephemeral refs/pull/N/merge ref, so without
+  # this trigger the integrated tip of main is tested nowhere: a semantic
+  # conflict between two PRs merged minutes apart is caught by neither PR's run.
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+# NOTE: workflow-level paths-ignore above still skips the entire workflow for
+# pure doc/markdown changes.  The per-job path filters below provide finer
+# granularity so that, e.g., a Cargo.toml-only change skips FIPS/dylint.
+
+# Concurrency strategy:
+# - On pull_request: group by PR number. New commits cancel the in-flight run.
+# - On push (main/develop): include run_id so pushes never cancel each other,
+#   preventing required CI from silently being dropped.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  # We do NOT set RUSTC_WRAPPER globally; we'll enable it per-job after probing sccache.
+  # RUSTC_WRAPPER: sccache
+  SCCACHE_CACHE_SIZE: "2G"
+  # Usually better determinism and smaller cache churn in CI.
+  CARGO_INCREMENTAL: "0"
+  # Pinned nightly toolchain used by the coverage job. Independent of the pin in
+  # shear-nightly.yml — they happen to match today but need not.
+  RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-04-16
+
+jobs:
+  # ── Change detection ──────────────────────────────────────────────────
+  # Lightweight first job that classifies which areas of the repo changed.
+  # Downstream jobs use these outputs to skip work that can't be affected.
+  # On workflow_dispatch every filter defaults to true (run everything).
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust:   ${{ steps.filter.outputs.rust }}
+      fips:   ${{ steps.filter.outputs.fips }}
+      dylint: ${{ steps.filter.outputs.dylint }}
+      deps:   ${{ steps.filter.outputs.deps }}
+      ci:     ${{ steps.filter.outputs.ci }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Detect changed paths
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'Makefile'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              # Input to `make check-release-config` in the test job: a config-only
+              # edit must still get the release configuration validated.
+              - 'release-plz.toml'
+            fips:
+              - 'libs/toolkit/**'
+              - 'libs/toolkit-http/**'
+              - 'libs/rustls-*/**'
+            dylint:
+              - 'tools/dylint_lints/**'
+            deps:
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+            ci:
+              - '.github/workflows/**'
+
+  # ── Jobs ──────────────────────────────────────────────────────────────
+
+  # Fast clippy: ubuntu only, 2-pass strategy (~5-6 min vs 30-40 min before).
+  # Linting output is platform-independent; platform-specific paths (fips) are
+  # covered by the test-fips job. Full feature matrix runs nightly (clippy-nightly.yml).
+  clippy:
+    name: Clippy
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C debuginfo=0"
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install protoc
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: protoc@3.34.1
+
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
+          cache: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-hack
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-clippy-${{ hashFiles('rust-toolchain.toml') }}
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      - name: cargo clippy
+        run: make clippy
+
+  test:
+    name: Test Suite (${{ matrix.os }})
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+    env:
+      RUSTFLAGS: "-C debuginfo=0"
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Force LF in working tree (w/a for Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install protoc
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: protoc@3.34.1
+
+      - name: Validate gear naming conventions
+        run: python3 tools/scripts/validate_gear_names.py
+
+      - name: Validate packaging metadata (readme/license-file paths)
+        run: make check-packaging-metadata
+
+      - name: Validate release configuration (publish flags, release-plz.toml)
+        run: make check-release-config
+
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
+          cache: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Install nextest
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: nextest
+
+      # Cache Cargo registry/git + target/ across platforms.
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
+
+      # Install sccache (cross-platform)
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      - name: cargo test (no macros)
+        run: make test-no-macros
+
+  integration:
+    name: Integration tests
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C debuginfo=0"
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install protoc
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: protoc@3.34.1
+
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
+          cache: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Install nextest
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: nextest
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-integration-${{ hashFiles('rust-toolchain.toml') }}
+
+      # Install sccache (cross-platform)
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      - name: UI tests for toolkit macros libraries
+        run: make test-macros
+
+      - name: Test users_info with Postgres (integration)
+        run: make test-users-info-pg
+
+      - name: Test timescaledb usage-collector plugin (pg integration)
+        run: make test-usage-collector-pg
+
+      - name: Test postgres-cluster-plugin (pg integration)
+        run: make test-cluster-pg
+
+      - name: Test resource-group (pg smoke, integration)
+        # Fail if Docker is unreachable instead of letting the suite skip itself
+        # into a green step that asserted nothing.
+        env:
+          RG_PG_REQUIRE_DOCKER: "1"
+        run: make test-rg-pg
+
+      - name: Test toolkit-db (sqlite integration)
+        run: make test-sqlite
+
+      - name: Test toolkit-db (pg integration)
+        run: make test-pg
+
+      - name: Test toolkit-db (mysql integration)
+        run: make test-mysql
+
+  test-fips:
+    name: FIPS verification (${{ matrix.os }})
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.fips == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    env:
+      RUSTFLAGS: "-C debuginfo=0"
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Force LF in working tree (w/a for Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install protoc
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: protoc@3.34.1
+
+      # Go is only required for the aws-lc-fips-sys build on the Linux lane.
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
+          cache: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Install nextest
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: nextest
+
+      # FIPS builds use a SEPARATE sccache bucket from non-FIPS jobs. The `-fips`
+      # cache-key segment guarantees a runner that toggles between FIPS and
+      # non-FIPS builds never reuses non-FIPS object files, which would otherwise
+      # silently produce a mixed binary that passes tests but isn't a true FIPS build.
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-fips
+
+      # Install sccache (cross-platform)
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      # Linux: aws-lc-fips path via the existing make target
+      # (cf-gears-toolkit + cf-gears-toolkit-http, bootstrap + fips).
+      - name: FIPS tests (Linux / aws-lc-fips)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: make test-fips
+
+      # macOS: exercise the Apple corecrypto TLS provider path.
+      - name: FIPS tests (macOS / corecrypto)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo test -p cf-gears-rustls-corecrypto-provider --features fips
+          cargo test -p cf-gears-toolkit-http --features fips
+
+      # Windows: build-verify the CNG provider path. Compile-only is sufficient —
+      # runtime FIPS execution depends on host FIPS-mode policy (see ADR 0003).
+      - name: FIPS build check (Windows / CNG)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+
+  cfs:
+    name: CFS
+    uses: ./.github/workflows/cfs.yml
+
+  security:
+    name: Security (cargo-deny on Ubuntu)
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      # Install tools via prebuilt binaries for speed.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-deny@0.20.2
+
+      # Blocking gate: advisories, licenses, bans and sources.
+      - name: cargo deny check
+        run: make deny
+
+  coverage:
+    name: Code Coverage (cargo-llvm-cov)
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install protoc
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: protoc@3.34.1
+
+      - name: Install Rust toolchain (with llvm-tools)
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
+          components: llvm-tools-preview
+
+      # Override rust-toolchain.toml (which pins stable) for all cargo
+      # commands in this job.
+      - name: Pin nightly for all cargo commands
+        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-llvm-cov, nextest
+
+      # Generate lcov.info for upload. Customize flags/features as needed.
+      - name: Coverage (lcov)
+        env:
+          RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
+          CARGO_LLVM_COV_TARGET_DIR: llvm-cov-target
+          CARGO_LLVM_COV_BUILD_DIR: llvm-cov-build
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+
+      # Upload LCOV report as a GitHub Actions artifact so it is always
+      # available, even when Codecov is unavailable or rejects the upload.
+      - name: Upload LCOV artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 14
+
+      # Upload to Codecov. OIDC is used for non-fork events (push, dispatch);
+      # for fork PRs the action auto-detects the fork and falls back to
+      # tokenless upload (GitHub does not grant id-token:write for forks).
+      # fail_ci_if_error is true for non-fork events so upload failures are
+      # visible; for fork PRs it is best-effort (tokenless can be rate-limited).
+      # disable_search prevents auto-discovery of unrelated files (e.g.
+      # coverage_guard.rs) — only lcov.info is sent.
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' }}
+          files: lcov.info
+          disable_search: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
+
+  lint:
+    name: Architecture Lints (cargo gears lint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: protoc@3.34.1
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-gears
+        run: cargo install --locked cargo-gears
+
+      - name: Run architecture lints
+        run: cargo gears lint --dylint

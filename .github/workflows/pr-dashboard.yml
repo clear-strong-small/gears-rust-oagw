@@ -1,0 +1,787 @@
+name: PR → Pull Request Project Sync
+
+on:
+  # schedule:
+  #   - cron: "0 8-23 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    env:
+      # -----------------------------
+      # Organization / project
+      # -----------------------------
+      ORG: constructorfabric
+      PROJECT_NUMBER: 7
+
+      # -----------------------------
+      # GitHub Project IDs
+      # -----------------------------
+      PROJECT_ID: PVT_kwDODtiyIs4BOnpi
+
+      FIELD_LINK: PVTF_lADODtiyIs4BOnpizg9RKEc
+      FIELD_UNREPLIED_THREADS: PVTF_lADODtiyIs4BOnpizg9RKEg
+      FIELD_UNREPLIED_COMMENTS: PVTF_lADODtiyIs4BOnpizg9RKEk
+      FIELD_UNFINISHED_REVIEWS: PVTF_lADODtiyIs4BOnpizg9RKEo
+      FIELD_MERGE_ISSUES: PVTF_lADODtiyIs4BOnpizg9RKEs
+
+    steps:
+      - name: Sync pull requests into GitHub Project
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.PR_DASHBOARD_PROJECTS_TOKEN }}
+
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const {
+              ORG,
+              PROJECT_NUMBER,
+              PROJECT_ID,
+              FIELD_LINK,
+              FIELD_UNREPLIED_THREADS,
+              FIELD_UNREPLIED_COMMENTS,
+              FIELD_UNFINISHED_REVIEWS,
+              FIELD_MERGE_ISSUES
+            } = process.env;
+
+            const blockedMentions = new Set([
+              "gears"
+            ]);
+
+            let allowedUsers = new Set();
+
+            try {
+              const collaborators = await github.paginate(
+                github.rest.repos.listCollaborators,
+                {
+                  owner,
+                  repo,
+                  per_page: 100
+                }
+              );
+              allowedUsers = new Set((collaborators || []).map(u => u.login));
+            } catch (e) {
+              console.log(`Could not load collaborators: ${e.message}`);
+            }
+
+            const ignoredBots = new Set([
+              "coderabbitai[bot]",
+              "graphite-app[bot]",
+              "dependabot[bot]",
+              "codecov-commenter"
+            ]);
+
+            function fmtDuration(ms) {
+              const totalMinutes = Math.max(0, Math.floor(ms / 60000));
+              const days = Math.floor(totalMinutes / (60 * 24));
+              const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+              const minutes = totalMinutes % 60;
+              return `${days}d ${hours}h ${minutes}m`;
+            }
+
+            function guessAskedUser(body, asker, fallback) {
+              const text = body || "";
+              const mentions = [...text.matchAll(/@([A-Za-z0-9-]+)/g)]
+                .map(m => m[1]);
+              const asked = mentions.find(u => {
+                if (!u || u === asker) return false;
+                if (blockedMentions.has(u)) return false;
+                if (allowedUsers.size === 0) return true;
+                return allowedUsers.has(u);
+              });
+              return asked || fallback;
+            }
+
+            function normalizeTextForOverlap(text) {
+              return (text || "")
+                .replace(/\r\n/g, "\n")
+                .split("\n")
+                .map(l => l.trim())
+                .filter(l => l.length > 0)
+                .join("\n")
+                .replace(/\s+/g, " ")
+                .trim();
+            }
+
+            function extractQuotedText(body) {
+              const lines = (body || "").replace(/\r\n/g, "\n").split("\n");
+              const quoted = [];
+              for (const line of lines) {
+                const match = line.match(/^\s*>+\s?(.*)$/);
+                if (!match) continue;
+                const content = (match[1] || "").trim();
+                if (!content) continue;
+                quoted.push(content);
+              }
+              return quoted.join("\n").trim();
+            }
+
+            function hasQuotedOverlapAtLeast(quotedText, otherText, minChars) {
+              const quoted = normalizeTextForOverlap(quotedText);
+              const other = normalizeTextForOverlap(otherText);
+
+              if (!quoted || !other) return false;
+              if (quoted.length < minChars || other.length < minChars) return false;
+
+              const maxLen = 8000;
+              const q = quoted.slice(0, maxLen);
+              const o = other.slice(0, maxLen);
+
+              for (let i = 0; i + minChars <= o.length; i++) {
+                const chunk = o.slice(i, i + minChars);
+                if (q.includes(chunk)) return true;
+              }
+
+              const endChunk = o.slice(Math.max(0, o.length - minChars));
+              return !!endChunk && q.includes(endChunk);
+            }
+
+            function isReleasePr(title) {
+              return (title || "").toLowerCase().startsWith("chore: release");
+            }
+
+            /*
+             ------------------------------------------------------------
+             Load existing project items
+             ------------------------------------------------------------
+            */
+
+            const items = [];
+            let cursor = null;
+
+            while (true) {
+              const projectData = await github.graphql(`
+                query($org:String!, $number:Int!, $after:String) {
+                  organization(login:$org) {
+                    projectV2(number:$number) {
+                      items(first:100, after:$after) {
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                        nodes {
+                          id
+                          content {
+                            ... on Issue {
+                              number
+                              id
+                              title
+                              closed
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `, {
+                org: ORG,
+                number: Number(PROJECT_NUMBER),
+                after: cursor
+              });
+
+              const page = projectData.organization.projectV2.items;
+              items.push(...page.nodes);
+
+              if (!page.pageInfo.hasNextPage) break;
+              cursor = page.pageInfo.endCursor;
+            }
+
+            const projectItemsByPR = new Map();
+
+            for (const item of items) {
+              const title = item.content?.title;
+              if (!title) continue;
+
+              const m = title.match(/^PR #(\d+) - /);
+              if (!m) continue;
+
+              const prNumber = Number(m[1]);
+              if (!Number.isFinite(prNumber)) continue;
+
+              projectItemsByPR.set(
+                prNumber,
+                {
+                  itemId: item.id,
+                  issueNumber: item.content.number,
+                  issueNodeId: item.content.id,
+                  closed: item.content.closed
+                }
+              );
+            }
+
+            /*
+             ------------------------------------------------------------
+             Fetch open PRs
+             ------------------------------------------------------------
+            */
+
+            const prs = await github.paginate(
+              github.rest.pulls.list,
+              {
+                owner,
+                repo,
+                state: "open",
+                per_page: 100
+              }
+            );
+
+            const activePRs = new Set(
+              prs
+                .filter(p => !isReleasePr(p.title))
+                .map(p => p.number)
+            );
+
+            /*
+             ------------------------------------------------------------
+             Process each open PR
+             ------------------------------------------------------------
+            */
+
+            for (const pr of prs) {
+
+              if (isReleasePr(pr.title)) {
+                continue;
+              }
+
+              const prFull = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: pr.number
+              });
+
+              const prData = prFull.data;
+              const author = prData.user?.login;
+              if (!author) {
+                console.log(`Skipping PR #${pr.number} - author is null`);
+                continue;
+              }
+
+              const now = new Date();
+              const createdAt = new Date(prData.created_at);
+              const updatedAt = new Date(prData.updated_at);
+
+              const requestedReviewers =
+                (prData.requested_reviewers || [])
+                  .map(u => u?.login)
+                  .filter(login => {
+                    if (!login) return false;
+                    if (login === author) return false;
+                    if (login.endsWith("[bot]")) return false;
+                    if (ignoredBots.has(login)) return false;
+                    return true;
+                  });
+
+              let unfinishedReviews = requestedReviewers.length;
+              let unfinishedReviewers = [...requestedReviewers];
+
+              let ciFailedChecks = 0;
+
+              try {
+                const checks = await github.rest.checks.listForRef({
+                  owner,
+                  repo,
+                  ref: prData.head.sha,
+                  per_page: 100
+                });
+
+                const runs = checks.data.check_runs || [];
+                ciFailedChecks = runs.filter(r => r.conclusion === "failure").length;
+              } catch (e) {
+                try {
+                  const status = await github.rest.repos.getCombinedStatusForRef({
+                    owner,
+                    repo,
+                    ref: prData.head.sha
+                  });
+                  const statuses = status.data.statuses || [];
+                  ciFailedChecks = statuses.filter(s => s.state === "failure" || s.state === "error").length;
+                } catch (e2) {
+                  console.log(
+                    `Could not load CI status for PR #${pr.number}: ${e2.message}`
+                  );
+                }
+              }
+
+              const mergeConflict = prData.mergeable_state === "dirty";
+              const mergeIssues = ciFailedChecks + (mergeConflict ? 1 : 0);
+
+              const ciParts = [];
+
+              if (ciFailedChecks > 0) {
+                ciParts.push(`${ciFailedChecks} tests failed`);
+              }
+
+              if (mergeConflict) {
+                ciParts.push("CONFLICT");
+              }
+
+              const ciStatus = ciParts.length ? ciParts.join(", ") : "OK";
+
+              try {
+                const reviews = await github.paginate(
+                  github.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100
+                  }
+                );
+
+                const latestByUser = new Map();
+                for (const r of (reviews || [])) {
+                  const login = r.user?.login;
+                  if (!login) continue;
+                  if (login.endsWith("[bot]") || ignoredBots.has(login)) continue;
+
+                  const submittedAt = r.submitted_at
+                    ? new Date(r.submitted_at).getTime()
+                    : 0;
+
+                  const prev = latestByUser.get(login);
+                  if (!prev || submittedAt >= prev.submittedAt) {
+                    latestByUser.set(login, {
+                      state: r.state,
+                      submittedAt
+                    });
+                  }
+                }
+
+                const allReviewers = new Set([
+                  ...requestedReviewers,
+                  ...latestByUser.keys()
+                ]);
+
+                const approvedBy = new Set(
+                  [...latestByUser.entries()]
+                    .filter(([, v]) => v.state === "APPROVED")
+                    .map(([k]) => k)
+                );
+
+                unfinishedReviewers =
+                  [...allReviewers]
+                    .filter(u => u !== author)
+                    .filter(u => !approvedBy.has(u))
+                    .sort((a, b) => a.localeCompare(b));
+                unfinishedReviews = unfinishedReviewers.length;
+              } catch (e) {
+                console.log(
+                  `Could not load reviews for PR #${pr.number}: ${e.message}`
+                );
+              }
+
+              const reviewData = await github.graphql(`
+                query($owner:String!, $repo:String!, $number:Int!) {
+                  repository(owner:$owner, name:$repo) {
+                    pullRequest(number:$number) {
+                      reviewThreads(first:100) {
+                        nodes {
+                          isResolved
+                          comments(last:50) {
+                            totalCount
+                            nodes {
+                              author { login }
+                              url
+                              bodyText
+                              createdAt
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `, {
+                owner,
+                repo,
+                number: pr.number
+              });
+
+              let openReviewThreads = 0;
+              let resolvedReviewThreads = 0;
+              let openReviewComments = 0;
+              let resolvedReviewComments = 0;
+
+              let unrepliedReviewThreads = 0;
+              const unrepliedReviewLinks = [];
+
+              for (const thread of reviewData.repository.pullRequest.reviewThreads.nodes) {
+                const total = thread.comments.totalCount;
+
+                if (thread.isResolved) {
+                  resolvedReviewThreads++;
+                  resolvedReviewComments += total;
+                  continue;
+                }
+
+                openReviewThreads++;
+                openReviewComments += total;
+
+                const comments = thread.comments.nodes;
+                if (!comments.length) continue;
+
+                const lastHuman =
+                  [...comments]
+                    .reverse()
+                    .find(c => {
+                      const login = c.author?.login;
+                      return (
+                        !!login &&
+                        !login.endsWith("[bot]") &&
+                        !ignoredBots.has(login)
+                      );
+                    });
+
+                if (!lastHuman) continue;
+
+                const asker = lastHuman.author.login;
+                if (asker === author) continue;
+
+                const asked = guessAskedUser(lastHuman.bodyText, asker, author);
+                unrepliedReviewThreads++;
+                unrepliedReviewLinks.push(`@${asker} asks @${asked} - ${lastHuman.url}`);
+              }
+
+              const prComments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  per_page: 100
+                }
+              );
+
+              const humanPrComments = (prComments || [])
+                .filter(c => {
+                  const login = c.user?.login;
+                  return (
+                    !!login &&
+                    !login.endsWith("[bot]") &&
+                    !ignoredBots.has(login)
+                  );
+                });
+
+              const sortedHumanPrComments = [...humanPrComments]
+                .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+              const resolvedPrCommentIds = new Set();
+              const replyPrCommentIds = new Set();
+
+              for (let i = 0; i < sortedHumanPrComments.length; i++) {
+                const comment = sortedHumanPrComments[i];
+                const quotedText = extractQuotedText(comment.body);
+                if (!quotedText) continue;
+
+                let isReply = false;
+                for (let j = i - 1; j >= 0; j--) {
+                  const other = sortedHumanPrComments[j];
+                  if (other.id === comment.id) continue;
+                  if (other.user?.login === comment.user?.login) continue;
+                  if (!hasQuotedOverlapAtLeast(quotedText, other.body, 100)) continue;
+                  resolvedPrCommentIds.add(other.id);
+                  isReply = true;
+                  break;
+                }
+
+                if (isReply) {
+                  replyPrCommentIds.add(comment.id);
+                }
+              }
+
+              const pendingPrComments =
+                sortedHumanPrComments
+                  .filter(c => c.user.login !== author)
+                  .filter(c => !resolvedPrCommentIds.has(c.id))
+                  .filter(c => !replyPrCommentIds.has(c.id));
+
+              const unrepliedPrCommentsCount = pendingPrComments.length;
+              const unrepliedPrCommentLinks = pendingPrComments.map(c => {
+                const asker = c.user.login;
+                const asked = guessAskedUser(c.body, asker, author);
+                return `@${asker} asks @${asked} - ${c.html_url}`;
+              });
+
+              /*
+               ------------------------------------------------------------
+               Ensure project item exists
+               ------------------------------------------------------------
+              */
+
+              const issueTitle = `PR #${pr.number} - ${pr.title}`;
+
+              const body =
+                `${issueTitle}\n\n` +
+                `Author: @${author}\n` +
+                `Opened: ${createdAt.toISOString()} (${fmtDuration(now - createdAt)} ago)\n` +
+                `Last update: ${updatedAt.toISOString()} (${fmtDuration(now - updatedAt)} ago)\n` +
+                `Draft: ${prData.draft ? "yes" : "no"}\n\n` +
+                `Review threads: ${openReviewThreads} open / ${resolvedReviewThreads} resolved\n` +
+                `Review comments: ${openReviewComments} open / ${resolvedReviewComments} resolved\n` +
+                `Unfinished reviews: ${unfinishedReviews} (${unfinishedReviewers.length ? unfinishedReviewers.map(u => "@" + u).join(", ") : "None"})\n` +
+                `Unreplied review threads: ${unrepliedReviewThreads}\n` +
+                `Unreplied PR comments: ${unrepliedPrCommentsCount}\n` +
+                `CI status: ${ciStatus}\n\n` +
+                `Unreplied review threads:\n` +
+                (unrepliedReviewLinks.length
+                  ? unrepliedReviewLinks.map(l => "- " + l).join("\n")
+                  : "None") +
+                `\n\n` +
+                `Unreplied PR comments:\n` +
+                (unrepliedPrCommentLinks.length
+                  ? unrepliedPrCommentLinks.map(l => "- " + l).join("\n")
+                  : "None");
+
+              let issue;
+
+              {
+                const searchTitle = issueTitle.replaceAll('"', '\\"');
+                const search = await github.rest.search.issuesAndPullRequests({
+                  q: `repo:${owner}/${repo} type:issue in:title "${searchTitle}"`,
+                  per_page: 10
+                });
+
+                const match =
+                  (search.data.items || []).find(i =>
+                    i.title === issueTitle && !i.pull_request
+                  );
+
+                if (match) {
+                  const existing = await github.rest.issues.get({
+                    owner,
+                    repo,
+                    issue_number: match.number
+                  });
+
+                  issue = existing.data;
+                }
+              }
+
+              if (!issue) {
+                const created = await github.rest.issues.create({
+                  owner,
+                  repo,
+                  title: issueTitle,
+                  body,
+                  labels: ["pr-issue"]
+                });
+
+                issue = created.data;
+              } else {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  title: issueTitle,
+                  body,
+                  labels: ["pr-issue"]
+                });
+              }
+
+              if (author.endsWith("[bot]") || ignoredBots.has(author)) {
+              } else if (allowedUsers.size > 0 && !allowedUsers.has(author)) {
+                console.log(
+                  `Skipping assignee for issue #${issue.number} - @${author} is not a repo collaborator`
+                );
+              } else {
+                try {
+                  await github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    assignees: [author]
+                  });
+                } catch (e) {
+                  console.log(
+                    `Could not assign @${author} to issue #${issue.number}: ${e.message}`
+                  );
+                }
+              }
+
+              let projectItem =
+                projectItemsByPR.get(pr.number);
+
+              let itemId;
+
+              if (!projectItem) {
+                const added = await github.graphql(`
+                  mutation($project:ID!, $content:ID!) {
+                    addProjectV2ItemById(
+                      input:{
+                        projectId:$project
+                        contentId:$content
+                      }
+                    ) {
+                      item { id }
+                    }
+                  }
+                `, {
+                  project: PROJECT_ID,
+                  content: issue.node_id
+                });
+
+                itemId =
+                  added.addProjectV2ItemById.item.id;
+
+              } else {
+                itemId = projectItem.itemId;
+              }
+
+              /*
+               ------------------------------------------------------------
+               Update project fields
+               ------------------------------------------------------------
+              */
+
+              await github.graphql(`
+                mutation(
+                  $project: ID!
+                  $item: ID!
+                  $link: String!
+                  $threads: Float!
+                  $comments: Float!
+                  $unfinished: Float!
+                ) {
+                  linkField: updateProjectV2ItemFieldValue(
+                    input: {
+                      projectId: $project
+                      itemId: $item
+                      fieldId: "${FIELD_LINK}"
+                      value: { text: $link }
+                    }
+                  ) {
+                    projectV2Item { id }
+                  }
+
+                  threadsField: updateProjectV2ItemFieldValue(
+                    input: {
+                      projectId: $project
+                      itemId: $item
+                      fieldId: "${FIELD_UNREPLIED_THREADS}"
+                      value: { number: $threads }
+                    }
+                  ) {
+                    projectV2Item { id }
+                  }
+
+                  commentsField: updateProjectV2ItemFieldValue(
+                    input: {
+                      projectId: $project
+                      itemId: $item
+                      fieldId: "${FIELD_UNREPLIED_COMMENTS}"
+                      value: { number: $comments }
+                    }
+                  ) {
+                    projectV2Item { id }
+                  }
+
+                  unfinishedReviewsField: updateProjectV2ItemFieldValue(
+                    input: {
+                      projectId: $project
+                      itemId: $item
+                      fieldId: "${FIELD_UNFINISHED_REVIEWS}"
+                      value: { number: $unfinished }
+                    }
+                  ) {
+                    projectV2Item { id }
+                  }
+                }
+              `, {
+                project: PROJECT_ID,
+                item: itemId,
+                link: pr.html_url,
+                threads: unrepliedReviewThreads,
+                comments: unrepliedPrCommentsCount,
+                unfinished: unfinishedReviews
+              });
+
+              try {
+                await github.graphql(`
+                  mutation($project: ID!, $item: ID!, $mergeIssues: Float!) {
+                    mergeIssuesField: updateProjectV2ItemFieldValue(
+                      input: {
+                        projectId: $project
+                        itemId: $item
+                        fieldId: "${FIELD_MERGE_ISSUES}"
+                        value: { number: $mergeIssues }
+                      }
+                    ) {
+                      projectV2Item { id }
+                    }
+                  }
+                `, {
+                  project: PROJECT_ID,
+                  item: itemId,
+                  mergeIssues
+                });
+              } catch (e) {
+                try {
+                  await github.graphql(`
+                    mutation($project: ID!, $item: ID!, $mergeIssuesText: String!) {
+                      mergeIssuesField: updateProjectV2ItemFieldValue(
+                        input: {
+                          projectId: $project
+                          itemId: $item
+                          fieldId: "${FIELD_MERGE_ISSUES}"
+                          value: { text: $mergeIssuesText }
+                        }
+                      ) {
+                        projectV2Item { id }
+                      }
+                    }
+                  `, {
+                    project: PROJECT_ID,
+                    item: itemId,
+                    mergeIssuesText: String(mergeIssues)
+                  });
+                } catch (e2) {
+                  console.log(
+                    `Could not update merge issues field for PR #${pr.number}: ${e2.message}`
+                  );
+                }
+              }
+            }
+
+            /*
+             ------------------------------------------------------------
+             Archive project items for closed PRs
+             ------------------------------------------------------------
+            */
+
+            for (const [prNumber, item] of projectItemsByPR.entries()) {
+              if (!activePRs.has(prNumber)) {
+                if (item.issueNumber) {
+                  await github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number: item.issueNumber,
+                    state: "closed"
+                  });
+                }
+
+                await github.graphql(`
+                  mutation($project:ID!, $item:ID!) {
+                    archiveProjectV2Item(
+                      input:{ projectId:$project, itemId:$item }
+                    ) {
+                      item { id }
+                    }
+                  }
+                `, {
+                  project: PROJECT_ID,
+                  item: item.itemId
+                });
+              }
+            }

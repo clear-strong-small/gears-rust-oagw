@@ -1,0 +1,56 @@
+name: GTS Validation
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.md'
+      - '**/*.json'
+      - '**/*.yaml'
+      - '**/*.yml'
+      - 'docs/**'
+      - 'guidelines/**'
+  workflow_dispatch:
+
+concurrency:
+  group: gts-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Local dev enables incremental compilation via [profile.dev]; CI does not want
+  # the extra codegen and disk churn.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  gts_validate:
+    name: Validate GTS Identifiers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # cache-bin caches ${CARGO_HOME}/bin, so the gts-validator binary is
+          # restored across runs instead of being recompiled from source every
+          # time (doc-only PRs were paying a multi-minute build otherwise).
+          cache-bin: true
+          cache-targets: false
+          shared-key: gts-validator-0.10.1
+
+      - name: Install gts-validator
+        # Pinned + --locked for reproducibility. On a cache hit the binary is
+        # already present, so cargo install detects it and skips the compile.
+        run: cargo install gts-validator --version 0.10.1 --locked
+
+      - name: Validate GTS identifiers
+        run: make gts-docs
