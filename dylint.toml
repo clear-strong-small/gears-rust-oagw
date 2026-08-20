@@ -52,7 +52,6 @@ excluded_paths = [
     "gears/system/grpc-hub",
     "gears/system/gear-orchestrator",
     "gears/system/nodes-registry",
-    "gears/system/oagw",
     "gears/system/types-registry",
     "gears/system/usage-collector",
 ]

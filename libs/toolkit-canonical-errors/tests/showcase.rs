@@ -7,7 +7,7 @@ use toolkit_gts::{gts_id, gts_uri};
 const USER_RESOURCE: &str = gts_id!("cf.core.users.user.v1~");
 const FILE_RESOURCE: &str = gts_id!("cf.core.files.file.v1~");
 const TENANT_RESOURCE: &str = gts_id!("cf.core.tenants.tenant.v1~");
-const UPSTREAM_RESOURCE: &str = gts_id!("cf.oagw.upstreams.upstream.v1~");
+const UPSTREAM_RESOURCE: &str = gts_id!("cf.core.upstreams.upstream.v1~");
 
 #[resource_error(gts_id!("cf.core.users.user.v1~"))]
 struct UserResourceError;
@@ -18,7 +18,7 @@ struct FileResourceError;
 #[resource_error(gts_id!("cf.core.tenants.tenant.v1~"))]
 struct TenantResourceError;
 
-#[resource_error(gts_id!("cf.oagw.upstreams.upstream.v1~"))]
+#[resource_error(gts_id!("cf.core.upstreams.upstream.v1~"))]
 struct UpstreamResourceError;
 
 // =========================================================================

@@ -3,8 +3,8 @@ pytest>=9.0.3
 httpx>=0.28.0  # Previously 0.23.0 minimum for PYSEC-2022-183 fix
 pytest-asyncio
 pytest-timeout>=2.3
-aiohttp>=3.13.3  # Mock upstream server for OAGW E2E tests
-websockets>=14.0  # WebSocket client for OAGW WebSocket proxy E2E tests
+aiohttp>=3.13.3
+websockets>=14.0
 
 
 cryptography>=41.0  # Ed25519 public-key derivation for file-storage lifecycle E2E

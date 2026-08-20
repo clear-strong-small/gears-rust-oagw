@@ -59,7 +59,6 @@ NOT IN THIS DOCUMENT (see other templates):
   ✗ Stakeholder needs (managed at project/task level by steering committee)
   ✗ Technical architecture, design decisions → DESIGN.md
   ✗ Why a specific technical approach was chosen → ADR/
-  ✗ Detailed implementation flows, algorithms → features/
 
 STANDARDS ALIGNMENT:
   - IEEE 830 / ISO/IEC/IEEE 29148:2018 (requirements specification)
@@ -571,15 +570,6 @@ None. All project-default NFRs apply to this gear.
 - **Description**: Proxy endpoint at `{METHOD} /api/oagw/v1/proxy/{alias}[/{path}][?{query}]` that forwards requests to external services with credential injection and transformation.
 - **Breaking Change Policy**: Major version bump required (v1 → v2)
 
-#### SDK Client Trait
-
-- [ ] `p1` - **ID**: `cpt-cf-oagw-interface-sdk-client`
-
-- **Type**: Rust trait (`ServiceGatewayClientV1` in `oagw-sdk` crate)
-- **Stability**: unstable
-- **Description**: Public Rust trait for inter-gear communication. Exposes upstream and route management operations and proxy invocation for in-process callers.
-- **Breaking Change Policy**: Trait changes require coordinated release of all dependent gears
-
 ### 7.2 External Integration Contracts
 
 #### Credential Store Contract
@@ -765,4 +755,3 @@ None. All project-default NFRs apply to this gear.
 
 - **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)

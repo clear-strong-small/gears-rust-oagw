@@ -24,11 +24,6 @@ use crate::infra::storage::repo_impl::SecretRepoImpl;
 use crate::infra::tenant_resolver::TenantResolverDir;
 use crate::infra::types_registry::GtsSecretTypeResolver;
 
-// `system` capability is required in this platform: consumers like `oagw` are
-// system modules and resolve `CredStoreClientV1` from the ClientHub during their
-// `init`. System modules initialize before non-system ones
-// (`modules_by_system_priority`), so credstore must also be a system module to
-// register its client before those consumers init.
 #[toolkit::gear(
     name = "credstore",
     deps = [authz_resolver, tenant_resolver, types_registry],

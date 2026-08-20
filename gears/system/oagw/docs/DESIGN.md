@@ -59,21 +59,13 @@ This design satisfies the requirements for centralized outbound traffic manageme
 
 **Architecture Decision Records**:
 
-- `cpt-cf-oagw-adr-component-architecture` — Single gear with internal trait-based service isolation
 - `cpt-cf-oagw-adr-request-routing` — Path-based routing with alias resolution
 - `cpt-cf-oagw-adr-plugin-system` — Three plugin types with deterministic execution order
 - `cpt-cf-oagw-adr-rate-limiting` — Token bucket algorithm with hierarchical merge
-- `cpt-cf-oagw-adr-circuit-breaker` — State machine with configurable thresholds and fallback
 - `cpt-cf-oagw-adr-cors` — Built-in CORS handler with per-upstream/route config
 - `cpt-cf-oagw-adr-data-plane-caching` — Control plane caching strategies
 - `cpt-cf-oagw-adr-state-management` — CP/DP state structures with cache invalidation
-- `cpt-cf-oagw-adr-storage-schema` — Cross-database relational schema with JSON config blobs
-- `cpt-cf-oagw-adr-resource-identification` — Layered resource model with alias resolution
-- `cpt-cf-oagw-adr-concurrency-control` — Per-scope in-flight request limits
-- `cpt-cf-oagw-adr-backpressure-queueing` — Bounded queueing with degradation strategies
 - `cpt-cf-oagw-adr-error-source-distinction` — Response header for gateway vs upstream errors
-- `cpt-cf-oagw-adr-grpc-support` — HTTP/2 multiplexing with protocol detection
-- `cpt-cf-oagw-adr-rust-abi-client-library` — Rust ABI client for internal gear routing
 - `cpt-cf-oagw-adr-oauth2-client-credentials-auth-plugin` — OAuth2 Client Credentials auth plugin with internal token cache
 
 ### 1.3 Architecture Layers
@@ -85,7 +77,6 @@ This design satisfies the requirements for centralized outbound traffic manageme
 | **Transport** (`api/rest/`) | HTTP handling, request parsing, response serialization | Axum handlers, DTOs, extractors, OperationBuilder route registration |
 | **Domain** (`domain/`) | Business logic, service traits, repository contracts | `ControlPlaneService`, `DataPlaneService`, `AuthPlugin` trait, domain models |
 | **Infrastructure** (`infra/`) | External integrations, persistence, proxy engine | SeaORM repositories, Pingora proxy bridge, plugin registry, type provisioning |
-| **SDK** (`oagw-sdk/`) | Public API for inter-gear communication | `ServiceGatewayClientV1` trait, SDK models, error types |
 
 The gear follows DDD-Light layering: domain layer has no infrastructure dependencies; infrastructure implements domain traits; transport layer maps between HTTP and domain types.
 
@@ -248,8 +239,6 @@ classDiagram
 
 Full schema: [schemas/upstream.v1.schema.json](./schemas/upstream.v1.schema.json)
 
-Sharing fields fragment: [schemas/oagw_upstream_sharing_fields.fragment.json](./schemas/oagw_upstream_sharing_fields.fragment.json)
-
 #### Route Schema
 
 **Base type**: `gts.cf.core.oagw.route.v1~`
@@ -258,7 +247,7 @@ Full schema: [schemas/route.v1.schema.json](./schemas/route.v1.schema.json)
 
 #### Plugin Schemas
 
-**Auth Plugin** — Base type: `gts.cf.core.oagw.auth_plugin.v1~` — [schemas/auth_plugin.v1.schema.json](./schemas/auth_plugin.v1.schema.json)
+**Auth Plugin** — Base type: `gts.cf.core.oagw.auth_plugin.v1~`
 
 One per upstream. Named auth plugins resolved via in-process registries, not stored in `oagw_plugin`. UUID-backed auth plugins stored in `oagw_plugin`.
 
@@ -270,17 +259,17 @@ Built-in auth plugins:
 
 `basic.v1` and `bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `AuthPluginRegistry` — using either as `auth.plugin_type` fails with `unknown auth plugin`.
 
-**Guard Plugin** — Base type: `gts.cf.core.oagw.guard_plugin.v1~` — [schemas/guard_plugin.v1.schema.json](./schemas/guard_plugin.v1.schema.json)
+**Guard Plugin** — Base type: `gts.cf.core.oagw.guard_plugin.v1~`
 
 Multiple per upstream/route. Can reject requests before they reach upstream.
 
 | Plugin ID | Description |
 |---|---|
-| `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1` | Required header enforcement (request/response) — see [ADR: Required Headers Guard Plugin](./ADR/0017-required-headers-guard-plugin.md) |
+| `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1` | Required header enforcement (request/response) — see [ADR: Required Headers Guard Plugin](./ADR/0009-required-headers-guard-plugin.md) |
 
-`required_headers.v1` is the only guard identifier resolvable via `GuardPluginRegistry` and bindable through `plugins.items[].plugin_ref`. Timeout and CORS are core Data Plane functionality, not `GuardPlugin` trait implementations: request timeout is gear-level configuration, and CORS is configured via the dedicated `cors` field on `Upstream`/`Route` (see [ADR: CORS](./ADR/0006-cors.md)). Their `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` / `...cors.v1` identifiers exist only for types-registry cataloging and cannot be bound via `plugins.items[].plugin_ref`. Circuit breaker is likewise **core functionality** (not a plugin). See [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md).
+`required_headers.v1` is the only guard identifier resolvable via `GuardPluginRegistry` and bindable through `plugins.items[].plugin_ref`. Timeout and CORS are core Data Plane functionality, not `GuardPlugin` trait implementations: request timeout is gear-level configuration, and CORS is configured via the dedicated `cors` field on `Upstream`/`Route` (see [ADR: CORS](./ADR/0004-cors.md)). Their `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` / `...cors.v1` identifiers exist only for types-registry cataloging and cannot be bound via `plugins.items[].plugin_ref`. Circuit breaker is likewise **core functionality** (not a plugin).
 
-**Transform Plugin** — Base type: `gts.cf.core.oagw.transform_plugin.v1~` — [schemas/transform_plugin.v1.schema.json](./schemas/transform_plugin.v1.schema.json)
+**Transform Plugin** — Base type: `gts.cf.core.oagw.transform_plugin.v1~`
 
 Multiple per upstream/route, executed in order. Each plugin declares supported phases: `on_request`, `on_response`, `on_error`.
 
@@ -328,13 +317,6 @@ The database stores:
 
 ```text
 gears/system/oagw/
-├── oagw-sdk/              # Public API: ServiceGatewayClientV1 trait, models, errors
-│   └── src/
-│       ├── lib.rs         # Re-exports
-│       ├── api.rs         # ServiceGatewayClientV1 trait definition
-│       ├── models.rs      # SDK types (Upstream, Route, CreateUpstreamRequest, etc.)
-│       └── error.rs       # ServiceGatewayError
-│
 └── oagw/                  # Single gear crate with internal service isolation
     └── src/
         ├── lib.rs         # Public exports
@@ -363,8 +345,6 @@ gears/system/oagw/
 
 - **ControlPlaneService** (`domain/services/management.rs`): Manages configuration data. Handles CRUD operations for upstreams/routes, alias resolution, and repository access.
 - **DataPlaneService** (`infra/proxy/service.rs`): Orchestrates proxy requests. Resolves config via Control Plane, executes auth plugins, builds outbound HTTP requests, and forwards to upstream services.
-
-**Crate Naming**: Directory names hyphenated (`oagw-sdk`), package names `cf-` prefixed (`cf-gears-oagw-sdk`), library names underscored (`oagw_sdk`).
 
 #### Request Routing
 
@@ -501,7 +481,7 @@ Validation rules that can reject requests:
 | Query params | Validate against `match.http.query_allowlist`; reject if unknown |
 | Path suffix | Reject if `path_suffix_mode`: `disabled` and suffix provided |
 | Body | See body validation rules below |
-| CORS origin | Reject if origin is not in upstream's `allowed_origins` (actual cross-origin requests only; preflight returns permissive 204 at handler level — see [ADR: CORS](./ADR/0006-cors.md)) |
+| CORS origin | Reject if origin is not in upstream's `allowed_origins` (actual cross-origin requests only; preflight returns permissive 204 at handler level — see [ADR: CORS](./ADR/0004-cors.md)) |
 | CORS method | Reject if method is not in upstream's `allowed_methods` (actual cross-origin requests only) |
 
 #### Body Validation Rules
@@ -570,7 +550,7 @@ Without appropriate permissions, descendant must use ancestor's configuration as
 - Headers: Well-known headers stripping and validation.
 - Request Validation: Path, query parameters validation against route configuration.
 
-**Cross-Origin Resource Sharing (CORS)**: Built-in, configured per upstream/route. Preflight OPTIONS requests return a permissive 204 at the handler level (no upstream resolution or tenant context required). Origin validation happens on actual requests after upstream resolution, before forwarding. See [ADR: CORS](./ADR/0006-cors.md).
+**Cross-Origin Resource Sharing (CORS)**: Built-in, configured per upstream/route. Preflight OPTIONS requests return a permissive 204 at the handler level (no upstream resolution or tenant context required). Origin validation happens on actual requests after upstream resolution, before forwarding. See [ADR: CORS](./ADR/0004-cors.md).
 
 **HTTP Version Negotiation**: OAGW uses adaptive per-host HTTP version detection:
 1. **First request**: Attempt HTTP/2 via ALPN during TLS handshake
@@ -745,7 +725,7 @@ All gateway errors follow RFC 9457 Problem Details (`application/problem+json`) 
 
 #### Error Source Distinction
 
-OAGW distinguishes between **gateway errors** (originated by OAGW) and **upstream errors** (passthrough from upstream service) using the `X-OAGW-Error-Source` header. See [ADR: Error Source Distinction](./ADR/0013-error-source-distinction.md).
+OAGW distinguishes between **gateway errors** (originated by OAGW) and **upstream errors** (passthrough from upstream service) using the `X-OAGW-Error-Source` header. See [ADR: Error Source Distinction](./ADR/0007-error-source-distinction.md).
 
 - **Gateway error**: `X-OAGW-Error-Source: gateway` — response body is `application/problem+json`
 - **Upstream error**: `X-OAGW-Error-Source: upstream` — response body is passthrough from upstream as-is
@@ -824,7 +804,7 @@ Client → API Handler (auth, validate DTO) → ControlPlaneService (validate, w
 
 **ID**: `cpt-cf-oagw-db-schema`
 
-Schema follows portable relational baseline with JSON blobs for evolving configuration. See [ADR: Storage Schema](./ADR/0009-storage-schema.md) for full details.
+Schema follows portable relational baseline with JSON blobs for evolving configuration.
 
 #### Core Tables
 
@@ -854,8 +834,6 @@ All resources use anonymous GTS identifiers in API path parameters:
 - Routes: `gts.cf.core.oagw.route.v1~{uuid}`
 - Plugins: `gts.cf.core.oagw.{type}_plugin.v1~{uuid}`
 
-See [ADR: Resource Identification](./ADR/0010-resource-identification.md) for the layered resource model.
-
 #### Common Queries
 
 | Query | Description |
@@ -874,7 +852,7 @@ See [ADR: Resource Identification](./ADR/0010-resource-identification.md) for th
 
 OAGW does not cache upstream responses. Caching is client/upstream responsibility.
 
-Config caching (in-memory caching of effective upstream/route configuration to avoid DB reads on every proxy request) is a future consideration. See [ADR: Control Plane Caching](./ADR/0007-data-plane-caching.md) for design direction.
+Config caching (in-memory caching of effective upstream/route configuration to avoid DB reads on every proxy request) is a future consideration. See [ADR: Control Plane Caching](./ADR/0005-data-plane-caching.md) for design direction.
 
 ### 4.2 Metrics and Observability
 
@@ -942,17 +920,17 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 ### 4.6 Review
 
 1. Database schema, indexing and queries
-2. [ADR: Rust ABI / Client Libraries](./ADR/0015-rust-abi-client-library.md) — HTTP client abstractions, streaming support, plugin development APIs
+2. Rust ABI / client libraries — HTTP client abstractions, streaming support, plugin development APIs
 
 ### 4.7 Future Developments
 
-1. [Core] Circuit breaker: config and fallback strategies — [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md)
-2. [Core] Concurrency control — [ADR: Concurrency Control](./ADR/0011-concurrency-control.md)
-3. [Core] Backpressure queueing — [ADR: Backpressure](./ADR/0012-backpressure-queueing.md) — In-flight limits, queueing strategies, graceful degradation under load
+1. [Core] Circuit breaker: config and fallback strategies
+2. [Core] Concurrency control
+3. [Core] Backpressure queueing — In-flight limits, queueing strategies, graceful degradation under load
 4. [Plugin] Starlark standard library extensions (e.g., HTTP client, caching), with security considerations. Auth plugins may need network I/O.
 5. [Security] TLS certificate pinning — Pin specific certificates/public keys for critical upstreams to prevent MITM attacks
 6. [Security] mTLS support — Mutual TLS for client certificate authentication with upstream services
-7. [Protocol] gRPC support — HTTP/2 multiplexing with content-type detection — [ADR: gRPC Support](./ADR/0014-grpc-support.md) — **Requires prototype**
+7. [Protocol] gRPC support — HTTP/2 multiplexing with content-type detection — **Requires prototype**
 8. [Deployment] Registry-only mode — All upstreams, routes, and plugin configs sourced exclusively from type registry (no management API CRUD). The `post_init()` provisioning path already materializes registry entities through the full domain validation pipeline. A registry-only mode would require: (a) config flag to disable or make CRUD endpoints read-only, (b) soft-fail on invalid entities (skip with warning instead of blocking startup), (c) a validation feedback mechanism so config authors can discover rejected entities — e.g., status writeback on GTS entities or a dedicated provisioning status endpoint. This is a platform-level concern: any gear consuming GTS entities for configuration faces the same write-time validation gap.
 
 ## 5. Traceability
@@ -978,18 +956,10 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 
 | ADR | Design Element |
 |---|---|
-| [0001 Component Architecture](./ADR/0001-component-architecture.md) | `cpt-cf-oagw-component-model` |
-| [0002 Request Routing](./ADR/0002-request-routing.md) | `cpt-cf-oagw-component-model`, `cpt-cf-oagw-seq-proxy-flow` |
-| [0003 Plugin System](./ADR/0003-plugin-system.md) | `cpt-cf-oagw-component-model` |
-| [0004 Rate Limiting](./ADR/0004-rate-limiting.md) | `cpt-cf-oagw-component-model` |
-| [0005 Circuit Breaker](./ADR/0005-circuit-breaker.md) | `cpt-cf-oagw-interface-api` |
-| [0006 CORS](./ADR/0006-cors.md) | `cpt-cf-oagw-component-model` |
-| [0007 Control Plane Caching](./ADR/0007-data-plane-caching.md) | `cpt-cf-oagw-tech-dependencies` |
-| [0008 State Management](./ADR/0008-state-management.md) | `cpt-cf-oagw-component-model` |
-| [0009 Storage Schema](./ADR/0009-storage-schema.md) | `cpt-cf-oagw-db-schema` |
-| [0010 Resource Identification](./ADR/0010-resource-identification.md) | `cpt-cf-oagw-design-domain-model` |
-| [0011 Concurrency Control](./ADR/0011-concurrency-control.md) | `cpt-cf-oagw-component-model` |
-| [0012 Backpressure and Queueing](./ADR/0012-backpressure-queueing.md) | `cpt-cf-oagw-component-model` |
-| [0013 Error Source Distinction](./ADR/0013-error-source-distinction.md) | `cpt-cf-oagw-interface-api` |
-| [0014 gRPC Support](./ADR/0014-grpc-support.md) | `cpt-cf-oagw-interface-api` |
-| [0015 Rust ABI Client Library](./ADR/0015-rust-abi-client-library.md) | `cpt-cf-oagw-tech-dependencies` |
+| [0001 Request Routing](./ADR/0001-request-routing.md) | `cpt-cf-oagw-component-model`, `cpt-cf-oagw-seq-proxy-flow` |
+| [0002 Plugin System](./ADR/0002-plugin-system.md) | `cpt-cf-oagw-component-model` |
+| [0003 Rate Limiting](./ADR/0003-rate-limiting.md) | `cpt-cf-oagw-component-model` |
+| [0004 CORS](./ADR/0004-cors.md) | `cpt-cf-oagw-component-model` |
+| [0005 Control Plane Caching](./ADR/0005-data-plane-caching.md) | `cpt-cf-oagw-tech-dependencies` |
+| [0006 State Management](./ADR/0006-state-management.md) | `cpt-cf-oagw-component-model` |
+| [0007 Error Source Distinction](./ADR/0007-error-source-distinction.md) | `cpt-cf-oagw-interface-api` |
