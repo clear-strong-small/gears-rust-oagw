@@ -160,8 +160,8 @@ gears:
       vendor: "constructorfabric"
       priority: 20
       tenants:
-        # Root tenant used by oagw + credstore e2e tests. The tenant tree has
-        # exactly one root; the hierarchy sub-root below hangs off this anchor.
+        # The tenant tree has exactly one root; the hierarchy sub-root below
+        # hangs off this anchor.
         - id: "00000000-df51-5b42-9538-d2b56b7ee953"
           name: "e2e-root"
           parent_id: null
@@ -279,7 +279,7 @@ gears:
             # not check it are unaffected.
             subject_type: "gts.cf.core.security.subject_user.v1~"
             token_scopes: ["*"]
-        # Hierarchy tenant tokens — used by budget allocation e2e tests
+        # Hierarchy tenant tokens
         - token: "e2e-token-hierarchy-root"
           identity:
             subject_id: "22222222-0000-0000-0000-000000000001"
@@ -301,8 +301,7 @@ gears:
             subject_tenant_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
             token_scopes: ["*"]
         # Nil-tenant token: static-authz denies requests with the nil UUID
-        # tenant, producing a clean 403 Forbidden. Used by
-        # testing/e2e/gears/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
+        # tenant, producing a clean 403 Forbidden.
         - token: "e2e-token-nil-tenant"
           identity:
             subject_id: "33333333-6a88-4768-9dfc-6bcd5187d9ed"
@@ -464,7 +463,7 @@ gears:
       proxy_timeout_secs: 2
       allow_http_upstream: true # Only for testing - do not enable in production without proper security controls
       ssrf_policy:
-        enabled: false # Disabled for e2e tests (mock upstreams use 127.0.0.1)
+        enabled: false
 
 # OpenTelemetry configuration (resource identity, tracing, metrics)
 opentelemetry:

@@ -59,7 +59,6 @@ NOT IN THIS DOCUMENT (see other templates):
   ✗ Stakeholder needs (managed at project/task level by steering committee)
   ✗ Technical architecture, design decisions → DESIGN.md
   ✗ Why a specific technical approach was chosen → ADR/
-  ✗ Detailed implementation flows, algorithms → features/
 
 STANDARDS ALIGNMENT:
   - IEEE 830 / ISO/IEC/IEEE 29148:2018 (requirements specification)
@@ -279,19 +278,20 @@ The system **MUST** include the following built-in plugins:
 **Auth Plugins**:
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.noop.v1` — No authentication
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1` — API key injection (header/query)
-- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1` — HTTP Basic authentication
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1` — OAuth2 client credentials flow
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1` — OAuth2 with Basic auth
-- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1` — Bearer token injection
+- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1` — HTTP Basic authentication; catalog identifier only, no backing `AuthPlugin` implementation
+- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1` — Bearer token injection; catalog identifier only, no backing `AuthPlugin` implementation
 
 **Guard Plugins**:
-- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` — Request timeout enforcement
-- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.cors.v1` — CORS preflight validation
+- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1` — Required header enforcement (request/response); the only guard identifier bindable via `plugins.items[].plugin_ref`
+- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` — Request timeout enforcement; core Data Plane config, catalog identifier only (not `plugins`-bindable)
+- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.cors.v1` — CORS preflight validation; core Data Plane config via `Upstream.cors`, catalog identifier only (not `plugins`-bindable)
 
 **Transform Plugins**:
-- `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.logging.v1` — Request/response logging
-- `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.metrics.v1` — Prometheus metrics collection
 - `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.request_id.v1` — X-Request-ID propagation
+- `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.logging.v1` — Request/response logging; core Data Plane instrumentation, catalog identifier only (not `TransformPluginRegistry`-resolvable)
+- `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.metrics.v1` — Prometheus metrics collection; core Data Plane instrumentation, catalog identifier only (not `TransformPluginRegistry`-resolvable)
 
 - **Rationale**: Covers the most common outbound API authentication and observability patterns out of the box.
 - **Actors**: `cpt-cf-oagw-actor-platform-operator`
@@ -570,15 +570,6 @@ None. All project-default NFRs apply to this gear.
 - **Description**: Proxy endpoint at `{METHOD} /api/oagw/v1/proxy/{alias}[/{path}][?{query}]` that forwards requests to external services with credential injection and transformation.
 - **Breaking Change Policy**: Major version bump required (v1 → v2)
 
-#### SDK Client Trait
-
-- [ ] `p1` - **ID**: `cpt-cf-oagw-interface-sdk-client`
-
-- **Type**: Rust trait (`ServiceGatewayClientV1` in `oagw-sdk` crate)
-- **Stability**: unstable
-- **Description**: Public Rust trait for inter-gear communication. Exposes upstream and route management operations and proxy invocation for in-process callers.
-- **Breaking Change Policy**: Trait changes require coordinated release of all dependent gears
-
 ### 7.2 External Integration Contracts
 
 #### Credential Store Contract
@@ -764,4 +755,3 @@ None. All project-default NFRs apply to this gear.
 
 - **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)

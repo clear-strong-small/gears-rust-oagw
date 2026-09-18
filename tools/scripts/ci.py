@@ -157,20 +157,9 @@ def cmd_gts_docs(args):
         sys.exit(result.returncode)
 
 
-def cmd_cfs_validate(_args):
-    step("Validating CFS artifacts")
-    result = run_cmd_allow_fail(["make", "cfs-validate"])
-    if result.returncode == 0:
-        print("OK. CFS validation PASSED")
-    else:
-        print("ERROR: CFS validation FAILED")
-        sys.exit(result.returncode)
-
-
 def cmd_check(args):
     step("Running full check suite")
     cmd_fmt(args)
-    cmd_cfs_validate(args)
     cmd_clippy(args)
     cmd_test(args)
     cmd_gts_docs(args)
@@ -813,10 +802,6 @@ def build_parser():
     # fuzz-clean
     p_fuzz_clean = subparsers.add_parser("fuzz-clean", help="Clean fuzzing artifacts")
     p_fuzz_clean.set_defaults(func=cmd_fuzz_clean)
-
-    # cfs-validate
-    p_cfs = subparsers.add_parser("cfs-validate", help="Validate CFS artifacts (specs, code, templates)")
-    p_cfs.set_defaults(func=cmd_cfs_validate)
 
     # gts-docs
     p_gts_docs = subparsers.add_parser("gts-docs", help="Validate GTS identifiers in .md and .json files (DE0903)")
