@@ -171,7 +171,7 @@
           "type": "object"
         },
         "plugin_ref": {
-          "description": "Plugin being bound, as a full GTS identifier: `gts.cf.core.oagw.{type}_plugin.v1~cf.core.oagw.{name}.v1` for a named plugin, `gts.cf.core.oagw.{type}_plugin.v1~{uuid}` for a custom one.",
+          "description": "Plugin being bound, as a full GTS identifier `gts.cf.core.oagw.{type}_plugin.v1~…`; see DESIGN's plugin identification model.",
           "format": "gts-identifier",
           "type": "string"
         }
@@ -353,7 +353,7 @@
       "properties": {
         "items": {
           "default": [],
-          "description": "Plugins bound to this route, applied in order; each item names the plugin by GTS identifier and carries its configuration.",
+          "description": "Plugins bound to this route, applied in order within each plugin type; each item names the plugin by GTS identifier and carries its configuration.",
           "items": {
             "$ref": "#/definitions/plugin_binding"
           },
@@ -374,7 +374,7 @@
     },
     "priority": {
       "default": 0,
-      "description": "Tie-breaker among an upstream's routes once the longest path prefix has matched: the higher priority wins. Two enabled routes with the same path, priority and method under one upstream conflict.",
+      "description": "Tie-breaker among an upstream's routes once the longest path prefix has matched. Two enabled routes with the same path, priority and method under one upstream conflict.",
       "type": "integer"
     },
     "rate_limit": {

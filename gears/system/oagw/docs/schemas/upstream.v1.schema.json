@@ -180,7 +180,7 @@
           "type": "object"
         },
         "plugin_ref": {
-          "description": "Plugin being bound, as a full GTS identifier: `gts.cf.core.oagw.{type}_plugin.v1~cf.core.oagw.{name}.v1` for a named plugin, `gts.cf.core.oagw.{type}_plugin.v1~{uuid}` for a custom one.",
+          "description": "Plugin being bound, as a full GTS identifier `gts.cf.core.oagw.{type}_plugin.v1~…`; see DESIGN's plugin identification model.",
           "format": "gts-identifier",
           "type": "string"
         }
@@ -378,7 +378,7 @@
     "plugins": {
       "properties": {
         "items": {
-          "description": "Plugins bound to this upstream, applied in order; each item names the plugin by GTS identifier and carries its configuration.",
+          "description": "Plugins bound to this upstream, applied in order within each plugin type; each item names the plugin by GTS identifier and carries its configuration.",
           "items": {
             "$ref": "#/definitions/plugin_binding"
           },
